@@ -55,27 +55,26 @@ class FDAlign(FinetuningModel):
         image, global_target = batch
         image = image.to(self.device)
         
-        # 获取输入数据的形状
-        b, c, h, w = image.shape
-        total_samples = self.way_num * (self.shot_num + self.query_num)
-        
+        # 使用 no_grad 提取特征
+        with torch.no_grad():
+            feat = self.emb_func(image)
+            
         # 分割 support 和 query 集
-        support_size = self.way_num * self.shot_num
-        query_size = self.way_num * self.query_num
+        support_feat, query_feat, support_target, query_target = self.split_by_episode(
+            feat, mode=1
+        )
+        episode_size = support_feat.size(0)
         
-        support_image = image[:support_size]
-        query_image = image[support_size:total_samples]
-        
-        # 生成标签
-        support_target = torch.arange(self.way_num).repeat_interleave(self.shot_num).to(self.device)
-        query_target = torch.arange(self.way_num).repeat_interleave(self.query_num).to(self.device)
-        
-        # 微调阶段
-        self.set_forward_adaptation(support_image, support_target)
-        
-        # 预测
-        output, _ = self.forward_output(query_image)
-        acc = self.accuracy(output, query_target)
+        output_list = []
+        for i in range(episode_size):
+            # 对每个 episode 进行 adaptation
+            output = self.set_forward_adaptation(
+                support_feat[i], support_target[i], query_feat[i]
+            )
+            output_list.append(output)
+            
+        output = torch.cat(output_list, dim=0)
+        acc = accuracy(output, query_target.reshape(-1))
         
         return output, acc
         
@@ -162,29 +161,34 @@ class FDAlign(FinetuningModel):
         
         return output, acc, loss
         
-    def set_forward_adaptation(self, support_image, support_target):
+    def set_forward_adaptation(self, support_feat, support_target, query_feat):
         """微调阶段"""
-        # 创建优化器配置
-        optim_config = {
-            'name': 'SGD',
-            'kwargs': {
-                'lr': self.inner_param.get('lr', 0.01),
-                'momentum': 0.9,
-                'weight_decay': 0.0005
-            }
-        }
+        classifier = nn.Linear(self.feat_dim, self.way_num)
+        optimizer = self.sub_optimizer(classifier, self.inner_param["inner_optim"])
         
-        optimizer = self.sub_optimizer(self.classifier, optim_config)
+        classifier = classifier.to(self.device)
+        classifier.train()
         
-        self.train()
-        for _ in range(self.inner_param.get('adaptation_steps', 100)):
-            output, feat = self.forward_output(support_image)
-            loss = self.loss_func(output, support_target)
-            
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            
+        support_size = support_feat.size(0)
+        for epoch in range(self.inner_param["inner_train_iter"]):
+            rand_id = torch.randperm(support_size)
+            for i in range(0, support_size, self.inner_param["inner_batch_size"]):
+                select_id = rand_id[
+                    i : min(i + self.inner_param["inner_batch_size"], support_size)
+                ]
+                batch = support_feat[select_id]
+                target = support_target[select_id]
+                
+                output = classifier(batch)
+                loss = self.loss_func(output, target)
+                
+                optimizer.zero_grad()
+                loss.backward(retain_graph=True)
+                optimizer.step()
+                
+        output = classifier(query_feat)
+        return output
+        
     def accuracy(self, output, target):
         """计算准确率"""
         pred = output.argmax(dim=1)
