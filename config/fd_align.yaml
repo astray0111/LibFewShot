@@ -5,6 +5,7 @@ includes:
   - headers/misc.yaml
   - headers/model.yaml
   - headers/optimizer.yaml
+  - backbones/resnet12.yaml  # 论文使用 resnet12
 
 # 训练设置
 epoch: 60  # 论文中使用60轮
@@ -21,7 +22,7 @@ test_query: 15
 
 # 模型设置
 backbone:
-  name: resnet12  # 使用现有的resnet12
+  name: resnet12  # 论文使用 resnet12
   kwargs:
     avg_pool: True
     is_flatten: True
@@ -29,28 +30,27 @@ backbone:
 classifier:
   name: FDAlign
   kwargs:
-    feat_dim: 640  # resnet12特征维度
-    num_class: 64
+    feat_dim: 640  # resnet12 特征维度
+    num_class: 64  # miniImageNet 训练集类别数
     inner_param:
-      temperature: 0.1
-      adaptation_steps: 100
-      lr: 0.01
-      n_templates: 60  # SPC参数
-      n_clusters: 20   # SPC参数
-      optimizer:  # 内部优化器配置
-        name: SGD
+      temperature: 0.1  # 论文中的温度参数
+      adaptation_steps: 100  # 内部适应步数
+      inner_train_iter: 100  # 内部训练迭代次数
+      inner_batch_size: 4    # 内部训练批次大小
+      inner_optim:          # 内部优化器配置（用于 adaptation）
+        name: SGD          # 论文使用 SGD 作为内部优化器
         kwargs:
-          lr: 0.01
+          lr: 0.01        # 论文中的内部学习率
           momentum: 0.9
           weight_decay: 0.0005
+      alpha: 1.0  # 分类损失权重
+      beta: 20.0  # 特征对齐损失权重
 
-# 优化器设置
+# 优化器设置（用于整体模型训练）
 optimizer:
-  name: SGD  # 论文使用SGD
+  name: Adam  # 论文使用 Adam 作为外部优化器
   kwargs:
-    lr: 0.01
-    momentum: 0.9
-    weight_decay: 0.0005
+    lr: 1e-3  # 论文中的外部学习率
 
 lr_scheduler:
   name: StepLR

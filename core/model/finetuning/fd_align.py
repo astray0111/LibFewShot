@@ -6,10 +6,14 @@ from sklearn.ensemble import IsolationForest
 from sklearn.cluster import KMeans
 import numpy as np
 import copy
+from core.utils import accuracy  # 导入 accuracy 函数
 
 class FDAlign(FinetuningModel):
     def __init__(self, feat_dim, num_class, inner_param, **kwargs):
         super(FDAlign, self).__init__(**kwargs)
+        
+        # 保存特征维度
+        self.feat_dim = feat_dim
         
         # 基础分类器
         self.classifier = nn.Linear(feat_dim, num_class)
@@ -157,7 +161,7 @@ class FDAlign(FinetuningModel):
             
         # 总损失
         loss = self.alpha * cls_loss + self.beta * align_loss
-        acc = self.accuracy(output, query_target)
+        acc = accuracy(output, query_target)
         
         return output, acc, loss
         
@@ -188,8 +192,3 @@ class FDAlign(FinetuningModel):
                 
         output = classifier(query_feat)
         return output
-        
-    def accuracy(self, output, target):
-        """计算准确率"""
-        pred = output.argmax(dim=1)
-        return (pred == target).float().mean().item()
