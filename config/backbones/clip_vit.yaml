@@ -1,0 +1,10 @@
+backbone:
+  name: CLIPViT
+  kwargs:
+    model_name: "ViT-B/32"
+    pretrained: True
+    freeze_layers: []  # empty list means no layers are frozen
+    is_feature: False
+    avg_pool: True     # use average pooling for feature extraction
+    dropout: 0.0       # dropout rate
+    image_size: 224    # CLIP ViT-B/32 expects 224x224 images 

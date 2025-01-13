@@ -2,193 +2,234 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from core.model.finetuning.finetuning_model import FinetuningModel
-from sklearn.ensemble import IsolationForest
 from sklearn.cluster import KMeans
-import numpy as np
-import copy
-from core.utils import accuracy  # 导入 accuracy 函数
+from sklearn.ensemble import IsolationForest
+from transformers import CLIPTextModel
+from core.utils import accuracy
+import clip
 
 class FDAlign(FinetuningModel):
-    def __init__(self, feat_dim, num_class, inner_param, **kwargs):
+    """Feature Discrimination Alignment for Fine-tuning Pre-trained Models"""
+    
+    def __init__(self, feat_dim, num_class=64, alpha=1.0, beta=20.0, **kwargs):
         super(FDAlign, self).__init__(**kwargs)
         
-        # 保存特征维度
         self.feat_dim = feat_dim
+        self.num_class = num_class
+        self.alpha = alpha
+        self.beta = beta
         
-        # 基础分类器
-        self.classifier = nn.Linear(feat_dim, num_class)
-        self.loss_func = nn.CrossEntropyLoss()
+        # Initialize CLIP
+        self.clip_model, _ = clip.load("ViT-B/32", device='cpu')
         
-        # FD-Align 参数
-        self.inner_param = inner_param
-        self.temp = inner_param.get('temperature', 0.1)
-        self.alpha = 1.0  # 分类损失权重
-        self.beta = 20.0  # 特征对齐损失权重
-        
-        # SPC 参数
-        self.n_templates = inner_param.get('n_templates', 60)  # 保留的模板数
-        self.n_clusters = inner_param.get('n_clusters', 20)   # 聚类中心数
-        
-        # 保存原始backbone
-        self.emb_func_orig = None
-        
-        # 计数器
-        self.episode_count = 0
-        
-        # 初始化网络
-        self._init_network()
-        
-    def _init_network(self):
-        """初始化网络"""
-        super()._init_network()
-        # 确保 emb_func 已经初始化
-        if self.emb_func is not None:
-            # 深度复制原始backbone
-            self.emb_func_orig = copy.deepcopy(self.emb_func)
-            self.emb_func_orig.eval()
-            for param in self.emb_func_orig.parameters():
-                param.requires_grad = False
+        # Freeze text encoder
+        for param in self.clip_model.parameters():
+            param.requires_grad = False
             
-    def forward_output(self, x):
-        feat = self.emb_func(x)
-        out = self.classifier(feat)
-        return out, feat
+        # 训练阶段使用 num_class，测试阶段使用 way_num
+        self.train_classifier = nn.Linear(feat_dim, num_class)
+        
+        # Cache for validation phase
+        self.cached_prototypes = None
+        
+        # Default templates
+        self.templates = [
+            "a photo of a {}",
+            "a photograph of a {}",
+            "an image of a {}",
+        ]
+        
+    def _get_text_features(self, class_names):
+        """Extract text features using templates"""
+        text_features = []
+        for class_name in class_names:
+            # Generate text descriptions using templates
+            class_texts = [template.format(class_name) for template in self.templates]
+            
+            # Encode text using CLIP
+            with torch.no_grad():
+                text_tokens = clip.tokenize(class_texts).to(self.device)
+                text_feats = self.clip_model.encode_text(text_tokens)
+                text_features.append(text_feats)
+            
+        return torch.stack(text_features)  # [n_classes, n_templates, feat_dim]
+        
+    def _optimize_templates(self, text_features):
+        """Remove outlier templates and cluster similar ones"""
+        # Get shapes
+        n_classes, n_templates, feat_dim = text_features.shape
+        
+        # Move features to CPU for sklearn operations
+        text_features_reshaped = text_features.view(-1, feat_dim).cpu()
+        
+        # Detect outliers using Isolation Forest
+        iso = IsolationForest(contamination=0.25)  # 保留约60%的模板
+        valid_mask = iso.fit_predict(text_features_reshaped)
+        valid_mask = valid_mask.reshape(n_classes, n_templates)
+        
+        # Collect valid features
+        valid_features = []
+        for i in range(n_classes):
+            class_valid_feats = text_features[i, valid_mask[i] == 1]
+            if len(class_valid_feats) > 0:
+                valid_features.append(class_valid_feats)
+            else:
+                # If no valid templates, keep all templates for this class
+                valid_features.append(text_features[i])
+        
+        # Ensure all classes have same number of templates
+        min_templates = min(feat.size(0) for feat in valid_features)
+        valid_features = [feat[:min_templates] for feat in valid_features]
+        valid_features = torch.stack(valid_features)
+        
+        # Convert features for K-means
+        valid_features_reshaped = valid_features.view(-1, feat_dim).cpu()
+        
+        # Cluster similar templates
+        # 确保聚类数至少为1，最多为有效样本数
+        n_clusters = max(1, min(
+            valid_features.size(1),  # 每个类的模板数
+            n_classes * 2,  # 类别数的两倍
+            3  # 最少3个聚类
+        ))
+        
+        kmeans = KMeans(n_clusters=n_clusters)
+        clusters = kmeans.fit_predict(valid_features_reshaped)
+        clusters = clusters.reshape(n_classes, -1)
+        
+        # Average features within each cluster
+        optimized_features = []
+        for i in range(n_classes):
+            class_features = []
+            for j in range(n_clusters):
+                cluster_mask = clusters[i] == j
+                if cluster_mask.any():
+                    cluster_mean = valid_features[i, cluster_mask].mean(0)
+                else:
+                    # 如果某个类别缺少某个聚类，使用该类别的平均特征
+                    cluster_mean = valid_features[i].mean(0)
+                class_features.append(cluster_mean)
+            optimized_features.append(torch.stack(class_features))
+        
+        return torch.stack(optimized_features)  # [n_classes, n_clusters, feat_dim]
+        
+    def _compute_kl_div(self, p, q):
+        """Compute KL divergence between two distributions"""
+        return F.kl_div(F.log_softmax(p, dim=-1), 
+                       F.softmax(q, dim=-1), 
+                       reduction='batchmean')
         
     def set_forward(self, batch):
-        """推理阶段"""
-        image, global_target = batch
-        image = image.to(self.device)
+        """Inference phase"""
+        images, _ = batch
+        images = images.to(self.device)
         
-        # 使用 no_grad 提取特征
-        with torch.no_grad():
-            feat = self.emb_func(image)
-            
-        # 分割 support 和 query 集
+        # Extract features
+        feat = self.emb_func(images)
+        
+        # Split features into support and query
         support_feat, query_feat, support_target, query_target = self.split_by_episode(
             feat, mode=1
         )
-        episode_size = support_feat.size(0)
         
-        output_list = []
-        for i in range(episode_size):
-            # 对每个 episode 进行 adaptation
-            output = self.set_forward_adaptation(
-                support_feat[i], support_target[i], query_feat[i]
-            )
-            output_list.append(output)
-            
-        output = torch.cat(output_list, dim=0)
-        acc = accuracy(output, query_target.reshape(-1))
+        # Only compute prototypes if not cached
+        if self.cached_prototypes is None:
+            self.cached_prototypes = self.get_prototypes(support_feat[0], support_target[0])
         
-        return output, acc
+        # Get predictions for query set
+        logits = self.get_score(query_feat.reshape(-1, self.feat_dim), self.cached_prototypes)
         
+        # Compute accuracy
+        acc = accuracy(logits, query_target.reshape(-1))
+        
+        return logits, acc
+        
+    def get_prototypes(self, support_feat, support_target):
+        """Compute class prototypes from support features"""
+        # Generate pseudo class names
+        unique_labels = support_target.unique().tolist()
+        class_names = [f"class_{label}" for label in unique_labels]
+        
+        # Extract text features
+        text_features = self._get_text_features(class_names)
+        
+        # Optimize templates
+        optimized_features = self._optimize_templates(text_features)
+        
+        # Compute prototypes
+        prototypes = optimized_features.mean(1)  # [n_classes, feat_dim]
+        
+        return prototypes
+        
+    def get_score(self, query_feat, prototypes):
+        """Compute classification scores"""
+        # Normalize features
+        query_feat = F.normalize(query_feat, p=2, dim=-1)
+        prototypes = F.normalize(prototypes, p=2, dim=-1)
+        
+        # Compute cosine similarity
+        logits = torch.mm(query_feat, prototypes.t())
+        
+        return logits 
+
+    def train(self, mode=True):
+        """Override train method to handle cache"""
+        super().train(mode)
+        if mode:  # training mode
+            self.cached_prototypes = None
+        return self
+
+    def eval(self):
+        """Override eval method to handle cache"""
+        super().eval()
+        self.cached_prototypes = None
+        return self 
+
     def set_forward_loss(self, batch):
-        """训练阶段"""
-        # 更新并打印进度
-        self.episode_count += 1
-        if self.episode_count % 100 == 0:  # 每100个episode打印一次
-            print(f"Episode: {self.episode_count}")
-            
-        image, global_target = batch
-        image = image.to(self.device)
+        """Training phase"""
+        images, targets = batch
+        images = images.to(self.device)
+        targets = targets.to(self.device)
         
-        # 获取输入数据的形状
-        b, c, h, w = image.shape
-        total_samples = self.way_num * (self.shot_num + self.query_num)
+        # Extract features using current encoder
+        feat = self.emb_func(images)  # [batch_size, feat_dim]
         
-        # 分割 support 和 query 集
-        support_size = self.way_num * self.shot_num
-        query_size = self.way_num * self.query_num
-        
-        support_image = image[:support_size]
-        query_image = image[support_size:total_samples]
-        
-        # 生成标签
-        support_target = torch.arange(self.way_num).repeat_interleave(self.shot_num).to(self.device)
-        query_target = torch.arange(self.way_num).repeat_interleave(self.query_num).to(self.device)
-        
-        # 微调阶段
-        self.train()
-        optimizer = self.sub_optimizer(self.classifier, {
-            'name': 'SGD',
-            'kwargs': {
-                'lr': self.inner_param.get('lr', 0.01),
-                'momentum': 0.9,
-                'weight_decay': 0.0005
-            }
-        })
-        
-        for _ in range(self.inner_param.get('adaptation_steps', 100)):
-            output, feat = self.forward_output(support_image)
-            loss = self.loss_func(output, support_target)
-            
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-        
-        # 前向传播
-        output, feat = self.forward_output(query_image)
-        
-        # 确保 emb_func_orig 已初始化
-        if self.emb_func_orig is None:
-            self._init_network()
-            
+        # Extract features using original CLIP (detached)
         with torch.no_grad():
-            feat_orig = self.emb_func_orig(query_image)  # 原始特征
+            orig_feat = self.clip_model.encode_image(images)
         
-        # 1. 分类损失
-        cls_loss = self.loss_func(output, query_target)
+        # Generate pseudo class names for current batch
+        unique_labels = targets.unique().tolist()
+        class_names = [f"class_{label}" for label in unique_labels]
         
-        # 2. 特征对齐损失
-        # 计算特征相似度
-        feat_norm = F.normalize(feat, dim=1)
-        feat_orig_norm = F.normalize(feat_orig, dim=1)
+        # Get text features and optimize templates
+        text_features = self._get_text_features(class_names)
+        optimized_features = self._optimize_templates(text_features)
         
-        # 计算特征分布
-        sim_matrix = torch.matmul(feat_norm, feat_orig_norm.t()) / self.temp
+        # Get spurious prototypes
+        spurious_prototypes = optimized_features.mean(0)  # [n_templates, feat_dim]
         
-        # 计算正样本对的相似度
-        pos_mask = (query_target.unsqueeze(0) == query_target.unsqueeze(1)).float()
-        pos_mask.fill_diagonal_(0)  # 排除自身
-        pos_sim = (sim_matrix * pos_mask).sum(1) / (pos_mask.sum(1) + 1e-8)
+        # Compute distributions over spurious prototypes
+        feat_norm = F.normalize(feat, p=2, dim=-1)
+        orig_feat_norm = F.normalize(orig_feat, p=2, dim=-1)
+        spurious_prototypes_norm = F.normalize(spurious_prototypes, p=2, dim=-1)
         
-        # 计算负样本对的相似度
-        neg_mask = 1 - pos_mask
-        neg_sim = (sim_matrix * neg_mask).sum(1) / (neg_mask.sum(1) + 1e-8)
+        # Current distribution
+        curr_dist = torch.matmul(feat_norm, spurious_prototypes_norm.t())
+        # Original distribution
+        orig_dist = torch.matmul(orig_feat_norm, spurious_prototypes_norm.t())
         
-        # 对比损失
-        align_loss = torch.mean(torch.relu(neg_sim - pos_sim + 0.1))
-            
-        # 总损失
-        loss = self.alpha * cls_loss + self.beta * align_loss
-        acc = accuracy(output, query_target)
+        # Compute KL divergence loss
+        kl_loss = self._compute_kl_div(curr_dist, orig_dist)
         
-        return output, acc, loss
+        # Classification loss
+        logits = self.train_classifier(feat)
+        cls_loss = F.cross_entropy(logits, targets)
         
-    def set_forward_adaptation(self, support_feat, support_target, query_feat):
-        """微调阶段"""
-        classifier = nn.Linear(self.feat_dim, self.way_num)
-        optimizer = self.sub_optimizer(classifier, self.inner_param["inner_optim"])
+        # Total loss
+        loss = self.alpha * cls_loss + self.beta * kl_loss
         
-        classifier = classifier.to(self.device)
-        classifier.train()
+        # Compute accuracy
+        acc = accuracy(logits, targets)
         
-        support_size = support_feat.size(0)
-        for epoch in range(self.inner_param["inner_train_iter"]):
-            rand_id = torch.randperm(support_size)
-            for i in range(0, support_size, self.inner_param["inner_batch_size"]):
-                select_id = rand_id[
-                    i : min(i + self.inner_param["inner_batch_size"], support_size)
-                ]
-                batch = support_feat[select_id]
-                target = support_target[select_id]
-                
-                output = classifier(batch)
-                loss = self.loss_func(output, target)
-                
-                optimizer.zero_grad()
-                loss.backward(retain_graph=True)
-                optimizer.step()
-                
-        output = classifier(query_feat)
-        return output
+        return logits, acc, loss 

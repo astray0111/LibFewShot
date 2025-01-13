@@ -13,9 +13,10 @@ def main(rank, config):
     trainer = Trainer(rank, config)
     trainer.train_loop(rank)
 
-
+# python -W ignore run_trainer.py
 if __name__ == "__main__":
     # config = Config("./reproduce/Baseline/Baseline-miniImageNet--ravi-Conv64F-5-Reproduce.yaml").get_config_dict()
+
     config = Config("./config/fd_align.yaml").get_config_dict()
 
     if config["n_gpu"] > 1:
